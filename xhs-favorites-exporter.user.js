@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         小紅書收藏匯出器 (XHS Favorites Exporter)
 // @namespace    xhs-local-tools
-// @version      0.2.1
-// @description  在小紅書收藏頁讀取已載入的收藏卡片,存入 LocalStorage,並可一鍵複製 JSON 貼到「收藏管理台」。
+// @version      0.3.0
+// @description  自動慢速滾動加載收藏、偵測「薯隊長」錯誤自動冷卻重試、依收藏夾名稱分類,一鍵複製 JSON 貼到「收藏管理台」。
 // @author       you
 // @match        *://*.xiaohongshu.com/*
 // @noframes
@@ -12,35 +12,29 @@
 // ==/UserScript==
 
 /* ============================================================
-  使用方式
-  ------------------------------------------------------------
-  1. 安裝 Tampermonkey,新增腳本,貼上本檔內容並儲存。
-  2. 打開小紅書網頁版 → 個人主頁 → 收藏 (collect) 分頁。
-  3. 往下滾動加載你想匯出的收藏 (腳本只讀「已載入」的 DOM,
-     不發任何請求,避免觸發反爬)。
-  4. 點畫面右下角的「📥 收藏匯出」浮動按鈕:
-     - 「掃描本頁」:把目前 DOM 上的收藏卡片寫入 LocalStorage
-     - 「複製 JSON」:把累積的資料複製到剪貼簿
-  也可用 Tampermonkey 選單裡的指令,效果相同。
+  v0.3.0 更新
+  - ▶ 自動滾動:以每輪 1.6~4 秒的隨機節奏慢慢加載,取代「按住下鍵」。
+    (按住下鍵 = 短時間狂發載入請求,是「薯隊長出了點問題」的主因)
+  - 錯誤偵測:出現「薯隊長」錯誤頁時自動暫停、冷卻 6~10 秒再續;
+    連續 3 次會嘗試自動點擊頁面上的「刷新/重試」,再不行才停止。
+  - 收藏夾分類:面板新增「收藏夾」輸入框(自動偵測、可手動改、
+    按網址記住),掃到的筆記會帶上這個標籤,匯入管理台自動建分類。
+  - 邊滾邊掃:防止清單過長時舊卡片被虛擬列表回收。
 
-  輸出格式 (貼到 xhs-favorites-manager.html 即可):
-  { "source": "xhs-tampermonkey", "items": [ { id, title, url, cover, author, noteType } ] }
-
-  注意:
-  - 小紅書前端 DOM 的 class 名是編譯產物 (形如 css-1abc...),
-    這裡用「屬性選擇器 + 結構備援」抓卡片, 版面更新時可能需調整。
-  - 封面圖使用 no-referrer 載入,離開小紅書網站後可能載不出來屬正常
-    (防盜鏈),管理台會顯示「無封面」。
+  為什麼之前沒有分類?收藏列表的卡片 DOM 只有 標題/封面/作者,
+  「屬於哪個收藏夾」和「#話題標籤」都不在上面(標籤只在筆記詳情頁)。
+  所以分類要嘛靠收藏夾名稱(本版),要嘛靠管理台的關鍵字規則。
 ============================================================ */
 
 (function () {
   'use strict';
 
-  // 診斷訊息:開 F12 Console 看到這行 = 腳本有被注入;沒看到 = 腳本根本沒執行
-  console.log('[XHS匯出器] v0.2.1 已載入 →', location.href);
+  // 診斷訊息:開 F12 Console 看到這行 = 腳本有被注入
+  console.log('[XHS匯出器] v0.3.0 已載入 →', location.href);
 
   var LS_KEY = 'xhs_tm_favorites';
-  var MAX_STORE = 5000; // LocalStorage 上限保護
+  var LS_FOLDER_MAP = 'xhs_tm_folder_names'; // 網址 → 收藏夾名稱
+  var MAX_STORE = 5000;
 
   /* ---------- LocalStorage ---------- */
   function load() {
@@ -56,30 +50,87 @@
       return false;
     }
   }
+  function folderMapLoad() {
+    try { return JSON.parse(localStorage.getItem(LS_FOLDER_MAP) || '{}'); }
+    catch (e) { return {}; }
+  }
+  function folderMapSave(m) {
+    try { localStorage.setItem(LS_FOLDER_MAP, JSON.stringify(m)); } catch (e) {}
+  }
+  function pageKey() { return location.pathname + location.search; }
 
-  /* ---------- 抓取目前 DOM 上的收藏卡片 ---------- */
-  // 小紅書卡片的連結一律指向 /explore/{id} 或 /discovery/item/{id} 或 /search_result/{id}
+  /* ---------- 「薯隊長」錯誤偵測 ---------- */
+  function errorActive() {
+    try {
+      var t = document.body ? document.body.textContent : '';
+      // 簡體「薯队长」/ 繁體「薯隊長」都認
+      return t.indexOf('薯队长') !== -1 || t.indexOf('薯隊長') !== -1;
+    } catch (e) { return false; }
+  }
+  function clickRetry() {
+    // 盡力找「刷新 / 重新加载 / 重试」按鈕點下去
+    var texts = ['刷新', '重新加载', '重新載入', '点击重试', '點擊重試', '重试', '重試'];
+    var els = document.querySelectorAll('button, a, div[role="button"], span');
+    for (var i = 0; i < els.length; i++) {
+      var txt = (els[i].textContent || '').trim();
+      if (texts.indexOf(txt) !== -1) { els[i].click(); return true; }
+    }
+    return false;
+  }
+
+  /* ---------- 收藏夾名稱 ---------- */
+  function detectFolderName() {
+    // 1) 這個網址上次用過的名字
+    var m = folderMapLoad();
+    if (m[pageKey()]) return m[pageKey()];
+    // 2) __INITIAL_STATE__ 盡力猜 (結構可能改版,抓不到就算了)
+    try {
+      var st = window.__INITIAL_STATE__;
+      var u = st && st.user;
+      var cands = [];
+      if (u && u.favFolder) cands.push(u.favFolder.name, u.favFolder.title, u.favFolder.folderName);
+      if (u && u.folder) cands.push(u.folder.name, u.folder.title, u.folder.folderName);
+      if (u && u.favFolderName) cands.push(u.favFolderName);
+      for (var i = 0; i < cands.length; i++) {
+        if (cands[i] && typeof cands[i] === 'string' && cands[i].trim()) return cands[i].trim();
+      }
+    } catch (e) {}
+    // 3) DOM 盡力猜:收藏夾頁的大標題
+    try {
+      var el = document.querySelector('[class*="favTitle"], [class*="folderName"], [class*="folder-name"], [class*="fav-title"]');
+      if (el && el.textContent && el.textContent.trim()) return el.textContent.trim().slice(0, 30);
+    } catch (e) {}
+    return '';
+  }
+  function currentFolderName() {
+    var inp = document.getElementById('xhs-tm-folder');
+    var v = inp ? String(inp.value || '').trim() : '';
+    if (v) { var m = folderMapLoad(); m[pageKey()] = v; folderMapSave(m); } // 記住這個網址對應的名字
+    return v;
+  }
+  function refreshFolderInput() {
+    var inp = document.getElementById('xhs-tm-folder');
+    if (inp) inp.value = detectFolderName();
+  }
+
+  /* ---------- DOM 收集 (只讀已載入的卡片,不發任何請求) ---------- */
   var NOTE_LINK = /^\/(?:explore|discovery\/item|search_result)\/([0-9a-f]{16,})/;
 
-  function scan() {
+  function collectFromDOM() {
     var found = {};
-    // 備援 1:任何指向筆記的 <a>
     document.querySelectorAll('a[href*="/explore/"], a[href*="/discovery/item/"], a[href*="/search_result/"]').forEach(function (a) {
       var m = (a.getAttribute('href') || '').match(NOTE_LINK);
       if (!m) return;
       var id = m[1];
       if (found[id]) return;
 
-      // 標題:卡片內的 .title / [class*="title"],否則用 a 的 title 屬性,再不然 alt
       var root = a.closest('section, li, div[class]') || a;
       var titleEl =
         root.querySelector('[class*="title"]') ||
         root.querySelector('.title') ||
         a.querySelector('[class*="title"]');
-      var title = (titleEl && titleEl.textContent.trim()) ||
-                  a.getAttribute('title') || '';
+      var title = (titleEl && titleEl.textContent.trim()) || a.getAttribute('title') || '';
 
-      // 封面:卡片內第一張 img (取 src 或 srcset 第一個)
       var img = root.querySelector('img') || a.querySelector('img');
       var cover = '';
       if (img) {
@@ -87,11 +138,9 @@
         if (!cover && img.srcset) cover = img.srcset.split(',')[0].trim().split(' ')[0];
       }
 
-      // 作者:卡片 hover 才出現的 .author / [class*="author"];抓不到就空
       var authorEl = root.querySelector('[class*="author"], .author, .name');
       var author = authorEl ? authorEl.textContent.trim() : '';
 
-      // 影片判定:卡片上常有播放圖示或 .play
       var isVideo = !!root.querySelector('[class*="play"], .play-icon, [class*="video"]');
 
       found[id] = {
@@ -101,11 +150,12 @@
         cover: cover,
         author: author,
         noteType: isVideo ? 'video' : 'normal',
+        category: '',
         scannedAt: new Date().toISOString(),
       };
     });
 
-    // 備援 2:結構抓不到時,試 __INITIAL_STATE__ (小紅書 SSR 注入的全域狀態)
+    // 備援:DOM 抓不到時讀 __INITIAL_STATE__
     if (Object.keys(found).length === 0) {
       try {
         var st = window.__INITIAL_STATE__;
@@ -122,30 +172,120 @@
               cover: (n.cover && (n.cover.url || n.cover.urlDefault)) || '',
               author: (n.user && n.user.nickname) || '',
               noteType: n.type === 'video' ? 'video' : 'normal',
+              category: '',
               scannedAt: new Date().toISOString(),
             };
           });
         }
-      } catch (e) { /* 忽略,結構變了 */ }
+      } catch (e) { /* 結構變了,忽略 */ }
     }
+    return found;
+  }
 
-    // 合併進 LocalStorage (以 id 去重)
+  /* 掃描:合併進 LocalStorage (id 去重);silent=true 給自動滾動用,不跳窗 */
+  function scan(silent) {
+    var found = collectFromDOM();
+    var folder = currentFolderName();
     var list = load();
     var map = {};
-    list.forEach(function (it) { map[it.id] = it; });
-    var added = 0;
-    Object.keys(found).forEach(function (id) {
-      if (!map[id]) { map[id] = found[id]; added++; }
-    });
-    var merged = Object.keys(map).map(function (k) { return map[k]; });
-    save(merged);
+    for (var i = 0; i < list.length; i++) map[list[i].id] = list[i];
 
-    var msg = '本頁掃描到 ' + Object.keys(found).length + ' 張卡片,新增加入 ' + added +
-              ' 筆,目前累積 ' + merged.length + ' 筆。\n\n' +
-              '提示:往下滾動加載更多後再按一次「掃描本頁」即可累積。';
-    alert(msg);
+    var added = 0, tagged = 0;
+    Object.keys(found).forEach(function (id) {
+      var it = found[id];
+      if (folder) it.category = folder;
+      if (!map[id]) { map[id] = it; added++; }
+      else if (folder && !map[id].category) { map[id].category = folder; tagged++; } // 只補空,不覆蓋已分類
+    });
+
+    var merged = Object.keys(map).map(function (k) { return map[k]; });
+    if (!save(merged)) return 0;
     updateBadge();
-    return merged;
+
+    if (!silent) {
+      alert('本頁掃描到 ' + Object.keys(found).length + ' 張卡片\n' +
+            '新增 ' + added + ' 筆' + (tagged ? ',補上標籤 ' + tagged + ' 筆' : '') + '\n' +
+            (folder ? '收藏夾標籤:「' + folder + '」' : '(未設定收藏夾標籤 → 匯入後為未分類)') + '\n' +
+            '目前累積 ' + merged.length + ' 筆');
+    }
+    return merged.length;
+  }
+
+  /* ---------- 自動滾動 (慢速隨機節奏 + 錯誤冷卻 + 到底偵測) ---------- */
+  var AS = { running: false, timers: [], stall: 0, lastH: -1, errStreak: 0 };
+
+  function setStatus(txt) {
+    var el = document.getElementById('xhs-tm-status');
+    if (el) el.textContent = txt;
+  }
+  function wait(ms) { AS.timers.push(setTimeout(step, ms)); }
+
+  function toggleAutoScroll() {
+    if (AS.running) { stopAutoScroll('已停止'); return; }
+    AS.running = true; AS.stall = 0; AS.lastH = -1; AS.errStreak = 0; AS.timers = [];
+    var b = document.getElementById('xhs-tm-scrollbtn');
+    if (b) b.textContent = '⏸ 停止滾動';
+    setStatus('自動滾動中…');
+    step();
+  }
+  function stopAutoScroll(msg) {
+    AS.running = false;
+    AS.timers.forEach(clearTimeout);
+    AS.timers = [];
+    var b = document.getElementById('xhs-tm-scrollbtn');
+    if (b) b.textContent = '▶ 自動滾動加載';
+    if (msg) setStatus(msg);
+    updateBadge();
+  }
+
+  function step() {
+    if (!AS.running) return;
+
+    // (a) 錯誤頁處理:冷卻 → 重試按鈕 → 放棄
+    if (errorActive()) {
+      AS.errStreak++;
+      if (AS.errStreak >= 3) {
+        if (clickRetry()) {
+          setStatus('⚠ 連續錯誤,已自動點擊「刷新」,觀察中…');
+          AS.errStreak = 0;
+          wait(8000);
+          return;
+        }
+        stopAutoScroll('⚠ 已停止(連續錯誤)');
+        alert('連續出現「薯隊長」錯誤,已停止自動滾動。\n\n' +
+              '這是小紅書的節流訊號 — 已掃描的 ' + load().length + ' 筆不會丟失,\n' +
+              '建議休息 1~2 分鐘、重新整理頁面後再按「自動滾動」繼續。');
+        return;
+      }
+      setStatus('⚠ 偵測到「薯隊長」錯誤,冷卻 ' + AS.errStreak + '/3,幾秒後自動重試…');
+      wait(6000 + Math.random() * 4000);
+      return;
+    }
+    AS.errStreak = 0;
+
+    // (b) 滾一段 (隨機距離,模擬真人)
+    window.scrollBy(0, Math.round(window.innerHeight * (0.7 + Math.random() * 0.5)));
+
+    // (c) 等畫面載入,邊滾邊掃 + 到底偵測
+    AS.timers.push(setTimeout(function () {
+      if (!AS.running) return;
+      scan(true); // 安靜掃描,防虛擬列表回收舊卡片
+
+      var h = document.documentElement.scrollHeight;
+      var atBottom = (window.innerHeight + window.scrollY) >= h - 60;
+      if (atBottom && h === AS.lastH) AS.stall++; else AS.stall = 0;
+      AS.lastH = h;
+
+      if (AS.stall >= 3) {
+        stopAutoScroll('✔ 加載完成');
+        alert('看起來到底了!累積 ' + load().length + ' 筆。\n\n' +
+              '要繼續下一個收藏夾:回去點開它,確認面板「收藏夾」欄的名稱後,\n' +
+              '再按一次「▶ 自動滾動加載」即可(名稱會自動記住)。');
+        return;
+      }
+      setStatus('自動滾動中… 累積 ' + load().length + ' 筆');
+      wait(1600 + Math.random() * 2400); // 每輪 1.6~4 秒
+    }, 800 + Math.random() * 700));
   }
 
   /* ---------- 匯出 / 複製 ---------- */
@@ -153,21 +293,19 @@
     var list = load().map(function (it) {
       return {
         id: it.id, title: it.title, url: it.url, cover: it.cover,
-        author: it.author, noteType: it.noteType,
+        author: it.author, noteType: it.noteType, category: it.category || '',
       };
     });
     return JSON.stringify({ source: 'xhs-tampermonkey', count: list.length, items: list }, null, 2);
   }
-
   function copyJson() {
     var list = load();
-    if (!list.length) { alert('還沒有資料,先按「掃描本頁」。'); return; }
+    if (!list.length) { alert('還沒有資料,先掃描或自動滾動。'); return; }
     var json = buildJson();
     if (typeof GM_setClipboard === 'function') {
       GM_setClipboard(json, 'text');
       alert('已複製 ' + list.length + ' 筆到剪貼簿!\n打開 xhs-favorites-manager.html 貼到「資料匯入」即可。');
     } else {
-      // fallback: 開個 textarea 用 execCommand
       var ta = document.createElement('textarea');
       ta.value = json;
       ta.style.position = 'fixed'; ta.style.opacity = '0';
@@ -178,31 +316,29 @@
       ta.remove();
     }
   }
-
   function clearData() {
     if (confirm('清除此網站 LocalStorage 中累積的收藏資料(' + load().length + ' 筆)?')) {
       localStorage.removeItem(LS_KEY);
       updateBadge();
+      setStatus('');
       alert('已清除。');
     }
   }
 
   /* ---------- 浮動面板 ---------- */
-  var panel = null;
-
   function buildPanel() {
-    panel = document.createElement('div');
+    var panel = document.createElement('div');
     panel.style.cssText = [
       'position:fixed', 'right:16px', 'bottom:16px', 'z-index:2147483647',
       'background:#fff', 'color:#333', 'border:1px solid #ddd',
       'border-radius:10px', 'box-shadow:0 4px 16px rgba(0,0,0,.15)',
       'padding:10px', 'font:13px/1.5 system-ui,sans-serif',
-      'display:flex', 'flex-direction:column', 'gap:6px', 'min-width:150px',
+      'display:flex', 'flex-direction:column', 'gap:6px', 'width:210px',
     ].join(';');
 
     var title = document.createElement('div');
-    title.textContent = '📥 收藏匯出';
-    title.style.cssText = 'font-weight:600;font-size:13px;';
+    title.textContent = '📥 收藏匯出 v0.3';
+    title.style.cssText = 'font-weight:600;font-size:13px;padding-right:16px;';
     panel.appendChild(title);
 
     var badge = document.createElement('div');
@@ -210,21 +346,45 @@
     badge.style.cssText = 'color:#888;font-size:12px;';
     panel.appendChild(badge);
 
-    function mkBtn(label, fn) {
+    // 收藏夾名稱列
+    var row = document.createElement('div');
+    row.style.cssText = 'display:flex;align-items:center;gap:6px;';
+    var lbl = document.createElement('span');
+    lbl.textContent = '收藏夾';
+    lbl.style.cssText = 'font-size:12px;color:#888;flex:none;';
+    var inp = document.createElement('input');
+    inp.type = 'text';
+    inp.id = 'xhs-tm-folder';
+    inp.placeholder = '(留空=未分類)';
+    inp.title = '目前打開的收藏夾名稱,掃描的筆記會帶上這個標籤';
+    inp.style.cssText = 'font:inherit;font-size:12px;padding:4px 6px;border:1px solid #ccc;border-radius:6px;width:130px;';
+    inp.value = detectFolderName();
+    row.appendChild(lbl); row.appendChild(inp);
+    panel.appendChild(row);
+
+    var status = document.createElement('div');
+    status.id = 'xhs-tm-status';
+    status.style.cssText = 'color:#888;font-size:11px;min-height:14px;';
+    panel.appendChild(status);
+
+    function mkBtn(label, fn, id, muted) {
       var b = document.createElement('button');
       b.textContent = label;
+      if (id) b.id = id;
       b.style.cssText = [
-        'font:inherit', 'padding:6px 10px', 'cursor:pointer',
-        'border:1px solid #ccc', 'border-radius:6px', 'background:#fff',
+        'font:inherit', 'font-size:12px', 'padding:6px 10px', 'cursor:pointer',
+        'border:1px solid #ccc', 'border-radius:6px',
+        'background:' + (muted ? 'transparent' : '#fff'), 'color:' + (muted ? '#999' : '#333'),
       ].join(';');
       b.onclick = fn;
       panel.appendChild(b);
       return b;
     }
 
-    mkBtn('① 掃描本頁', scan);
+    mkBtn('① 掃描本頁', function () { scan(false); });
+    mkBtn('▶ 自動滾動加載', toggleAutoScroll, 'xhs-tm-scrollbtn');
     mkBtn('② 複製 JSON', copyJson);
-    mkBtn('清除本機資料', clearData);
+    mkBtn('清除本機資料', clearData, null, true);
 
     var fold = document.createElement('button');
     fold.textContent = '—';
@@ -247,33 +407,37 @@
 
   function updateBadge() {
     var badge = document.getElementById('xhs-tm-badge');
-    if (badge) badge.textContent = '已累積:' + load().length + ' 筆';
+    if (badge) badge.textContent = (AS.running ? '⏳ ' : '') + '已累積:' + load().length + ' 筆';
   }
 
-  /* ---------- SPA:換頁後確保面板還在 ---------- */
-  var lastPath = '';
+  /* ---------- SPA:換頁保面板、帶入收藏夾名稱、被動錯誤提示 ---------- */
+  var lastKey = '';
   setInterval(function () {
-    if (location.pathname !== lastPath) {
-      lastPath = location.pathname;
+    var key = location.pathname + location.search;
+    if (key !== lastKey) {
+      lastKey = key;
+      refreshFolderInput(); // 換頁後重新帶入這個網址對應的收藏夾名稱
     }
-    if (!document.getElementById('xhs-tm-badge') && document.body) {
-      buildPanel();
+    if (!document.getElementById('xhs-tm-badge') && document.body) buildPanel();
+    if (!AS.running) {
+      var badge = document.getElementById('xhs-tm-badge');
+      if (badge) badge.textContent = (errorActive() ? '⚠ 頁面出錯,稍等或整理 • ' : '') + '已累積:' + load().length + ' 筆';
     }
   }, 1500);
 
-  /* ---------- 啟動:body 可能晚於 document-idle 才有,用雙保險 ---------- */
+  /* ---------- 選單指令 ---------- */
+  if (typeof GM_registerMenuCommand === 'function') {
+    GM_registerMenuCommand('① 掃描本頁收藏', function () { scan(false); });
+    GM_registerMenuCommand('▶/⏸ 自動滾動加載', toggleAutoScroll);
+    GM_registerMenuCommand('② 複製累積 JSON', copyJson);
+    GM_registerMenuCommand('清除本機累積資料', clearData);
+  }
+
+  /* ---------- 啟動 ---------- */
   function boot() {
     try { buildPanel(); }
     catch (e) { console.warn('[XHS匯出器] 建面板失敗:', e); }
   }
   if (document.body) boot();
   else document.addEventListener('DOMContentLoaded', boot);
-  // 極端情況:body 被 SPA 重建,定時器會再救一次(見上方 setInterval)
-
-  /* ---------- 選單指令 (Tampermonkey 圖示選單) ---------- */
-  if (typeof GM_registerMenuCommand === 'function') {
-    GM_registerMenuCommand('① 掃描本頁收藏', scan);
-    GM_registerMenuCommand('② 複製累積 JSON', copyJson);
-    GM_registerMenuCommand('清除本機累積資料', clearData);
-  }
 })();
