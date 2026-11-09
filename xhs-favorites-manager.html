@@ -1,0 +1,1062 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>小紅書收藏管理台</title>
+<!-- ============================================================
+  小紅書收藏夾管理台 (單檔 MVP)
+  - 純 HTML + 原生 JS,零依賴,離線可用 (雙擊即開)
+  - 資料來源:
+      A. 手動貼入:在小紅書收藏頁按 F12 → Network → 找到
+         notes API 的 JSON 回應 (或 Copy as cURL 後複製 -d 的 JSON),
+         整段貼進「資料匯入」文字框。
+      B. 油猴腳本:配套的 xhs-favorites-exporter.user.js 會把
+         抓到的收藏寫入 localStorage,並提供「匯出到管理台」按鈕,
+         把 JSON 放到剪貼簿,再回本頁貼入。
+  - 所有資料只存在本機 localStorage,不上傳任何伺服器。
+============================================================ -->
+<style>
+  /* ---------- 設計 tokens (取自 dataviz 參考調色盤,淺色為主) ---------- */
+  :root {
+    color-scheme: light dark;
+    --surface-1: #fcfcfb;          /* 卡片表面 */
+    --surface-0: #f9f9f7;          /* 頁面底色 */
+    --text-primary: #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted: #898781;
+    --grid: #e1e0d9;
+    --baseline: #c3c2b7;
+    --border: rgba(11,11,11,0.10);
+    --series-1: #2a78d6;           /* 唯一資料色:藍 (單系列圖表) */
+    --series-1-wash: rgba(42,120,214,0.10);
+    --danger: #d03b3b;
+    --radius: 8px;
+    --radius-sm: 6px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --surface-1: #1a1a19;
+      --surface-0: #0d0d0d;
+      --text-primary: #f0efec;
+      --text-secondary: #c3c2b7;
+      --text-muted: #898781;
+      --grid: #2c2c2a;
+      --baseline: #383835;
+      --border: rgba(255,255,255,0.10);
+      --series-1: #3987e5;
+      --series-1-wash: rgba(57,135,229,0.12);
+    }
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", "Microsoft JhengHei", sans-serif;
+    background: var(--surface-0);
+    color: var(--text-primary);
+    font-size: 14px;
+    line-height: 1.5;
+  }
+
+  /* ---------- 版面 ---------- */
+  .shell { max-width: 1280px; margin: 0 auto; padding: 20px 24px 48px; }
+
+  header.page {
+    display: flex; flex-wrap: wrap; gap: 12px; align-items: baseline; justify-content: space-between;
+    margin-bottom: 16px;
+  }
+  header.page h1 { font-size: 20px; font-weight: 650; margin: 0; }
+  header.page .sub { color: var(--text-secondary); font-size: 13px; }
+
+  /* 卡片 */
+  .card {
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px;
+    margin-bottom: 16px;
+  }
+  .card h2 { font-size: 14px; font-weight: 600; margin: 0 0 4px; }
+  .card .hint { color: var(--text-muted); font-size: 12px; margin: 0 0 10px; }
+
+  /* ---------- 表單元件 ---------- */
+  textarea {
+    width: 100%; min-height: 140px; resize: vertical;
+    font-family: ui-monospace, Consolas, monospace; font-size: 12px;
+    padding: 10px; border: 1px solid var(--baseline); border-radius: var(--radius-sm);
+    background: var(--surface-1); color: var(--text-primary);
+  }
+  textarea:focus { outline: 2px solid var(--series-1); outline-offset: 0; border-color: var(--series-1); }
+
+  button {
+    font: inherit; font-size: 13px; padding: 7px 14px;
+    border: 1px solid var(--baseline); border-radius: var(--radius-sm);
+    background: var(--surface-1); color: var(--text-primary);
+    cursor: pointer;
+  }
+  button:hover { background: var(--series-1-wash); }
+  button.primary {
+    background: var(--series-1); border-color: var(--series-1); color: #fff; font-weight: 600;
+  }
+  button.primary:hover { filter: brightness(1.08); }
+  button.subtle { border-color: transparent; color: var(--text-secondary); }
+  button.subtle:hover { border-color: var(--baseline); }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+
+  .btn-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; align-items: center; }
+  .row-inline { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+
+  input[type="text"], select {
+    font: inherit; font-size: 13px; padding: 7px 10px;
+    border: 1px solid var(--baseline); border-radius: var(--radius-sm);
+    background: var(--surface-1); color: var(--text-primary);
+  }
+  input[type="text"]:focus, select:focus { outline: 2px solid var(--series-1); border-color: var(--series-1); }
+
+  /* ---------- toast ---------- */
+  #toast {
+    position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%) translateY(20px);
+    background: var(--text-primary); color: var(--surface-1);
+    padding: 9px 18px; border-radius: 999px; font-size: 13px;
+    opacity: 0; pointer-events: none; transition: all .25s ease; z-index: 60;
+  }
+  #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+  /* ---------- 統計 ---------- */
+  .stats-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-bottom: 16px; }
+  .stat-tile {
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 12px 14px;
+  }
+  .stat-tile .label { font-size: 12px; color: var(--text-secondary); }
+  .stat-tile .value { font-size: 26px; font-weight: 600; line-height: 1.25; }
+
+  /* ---------- 分類條形圖 (單一藍色系) ---------- */
+  #chartCard { display: none; }
+  #barChart { width: 100%; }
+  .bar-row-label { font-size: 12px; fill: var(--text-secondary); }
+  .bar-value { font-size: 12px; fill: var(--text-secondary); }
+  #barChart .bar { fill: var(--series-1); }
+  #barChart .bar:hover { opacity: 0.82; }
+  #barChart .gridline { stroke: var(--grid); stroke-width: 1; }
+  #barChart .axis-line { stroke: var(--baseline); stroke-width: 1; }
+  #barChart text { font-family: inherit; }
+
+  /* ---------- 分類標籤列 ---------- */
+  .cat-bar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-bottom: 14px; }
+  .cat-chip {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 12.5px; padding: 5px 12px;
+    border: 1px solid var(--baseline); border-radius: 999px;
+    background: var(--surface-1); color: var(--text-secondary);
+    cursor: pointer; user-select: none;
+  }
+  .cat-chip:hover { background: var(--series-1-wash); }
+  .cat-chip.active {
+    background: var(--series-1); border-color: var(--series-1); color: #fff; font-weight: 600;
+  }
+  .cat-chip .n { opacity: 0.75; font-variant-numeric: tabular-nums; }
+
+  /* ---------- 卡片網格 ---------- */
+  #grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 14px; }
+  .note-card {
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: var(--radius); overflow: hidden;
+    display: flex; flex-direction: column;
+    transition: box-shadow .15s ease, transform .15s ease;
+  }
+  .note-card:hover { box-shadow: 0 4px 14px rgba(0,0,0,0.10); transform: translateY(-1px); }
+  .note-cover { position: relative; width: 100%; aspect-ratio: 3 / 4; background: var(--grid); }
+  .note-cover img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .note-cover .fallback {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    color: var(--text-muted); font-size: 12px; padding: 10px; text-align: center;
+  }
+  .note-body { padding: 10px 12px 12px; display: flex; flex-direction: column; gap: 8px; flex: 1; }
+  .note-title {
+    font-size: 13px; font-weight: 600; line-height: 1.4; margin: 0;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  }
+  .note-meta { font-size: 11.5px; color: var(--text-muted); display: flex; gap: 10px; flex-wrap: wrap; }
+  .note-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: auto; }
+  .tag-select {
+    font: inherit; font-size: 12px; padding: 3px 6px; flex: 1; min-width: 0;
+    border: 1px solid var(--baseline); border-radius: var(--radius-sm);
+    background: var(--surface-1); color: var(--text-primary);
+  }
+  .mini-btn {
+    font-size: 12px; padding: 4px 10px; border-radius: var(--radius-sm);
+    border: 1px solid var(--baseline); background: var(--surface-1); color: var(--text-secondary);
+    cursor: pointer; text-decoration: none; white-space: nowrap;
+  }
+  .mini-btn:hover { background: var(--series-1-wash); color: var(--text-primary); }
+  .del-btn:hover { color: var(--danger); border-color: var(--danger); }
+
+  #empty {
+    display: none; text-align: center; color: var(--text-muted);
+    padding: 48px 16px; border: 1px dashed var(--baseline); border-radius: var(--radius);
+  }
+
+  /* ---------- 表格視圖 ---------- */
+  .table-wrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+  th { color: var(--text-secondary); font-weight: 600; font-size: 12px; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  td a { color: var(--series-1); text-decoration: none; }
+  td a:hover { text-decoration: underline; }
+
+  /* ---------- 匯入分析 ---------- */
+  #importLog { font-size: 12px; color: var(--text-secondary); margin-top: 8px; min-height: 18px; }
+  #importLog .err { color: var(--danger); }
+  #importLog .ok { color: var(--text-primary); }
+
+  .view-toggle { display: inline-flex; border: 1px solid var(--baseline); border-radius: var(--radius-sm); overflow: hidden; }
+  .view-toggle button { border: none; border-radius: 0; padding: 6px 12px; }
+  .view-toggle button[aria-pressed="true"] { background: var(--series-1); color: #fff; }
+
+  details.raw { margin-top: 8px; }
+  details.raw summary { cursor: pointer; color: var(--text-muted); font-size: 12px; }
+  details.raw pre {
+    font-size: 11.5px; overflow: auto; max-height: 200px;
+    background: var(--surface-0); border: 1px solid var(--grid); border-radius: var(--radius-sm); padding: 8px;
+  }
+</style>
+</head>
+<body>
+<div class="shell">
+
+  <header class="page">
+    <div>
+      <h1>小紅書收藏管理台</h1>
+      <div class="sub">本地解析 · 分類 · 搜尋 · 匯出 — 資料只存於此瀏覽器 (localStorage)</div>
+    </div>
+    <div class="row-inline">
+      <button class="subtle" id="btnDemo">載入示範資料</button>
+      <button class="subtle" id="btnClear">清空所有資料</button>
+    </div>
+  </header>
+
+  <!-- ══════════════ 階段一:資料匯入 ══════════════ -->
+  <section class="card" id="importCard">
+    <h2>資料匯入</h2>
+    <p class="hint">
+      方式 A:在小紅書收藏頁按 F12 → Network → 重新整理 → 點開 <code>api/sns/web/v1/note/…</code> 之類的請求 →
+      Response 全選複製 → 貼到下方。也支援油猴腳本 (方式 B) 產生的 JSON、或本工具匯出的 JSON。
+    </p>
+    <textarea id="importBox" placeholder='貼上 JSON,例如:
+{ "data": { "notes": [ { "note_id": "...", "display_title": "...", "cover": { "url": "..." } } ] } }
+
+或本工具匯出格式:
+{ "items": [ { "id": "...", "title": "...", "url": "...", "cover": "..." } ] }'></textarea>
+    <div class="btn-row">
+      <button class="primary" id="btnImport">解析並匯入</button>
+      <button id="btnImportFile">從檔案匯入…</button>
+      <input type="file" id="fileInput" accept=".json,.txt" hidden>
+      <span id="importLog"></span>
+    </div>
+    <details class="raw" id="rawDetails" hidden>
+      <summary>檢視原始解析結果</summary>
+      <pre id="rawPreview"></pre>
+    </details>
+  </section>
+
+  <!-- ══════════════ 統計 + 圖表 ══════════════ -->
+  <div class="stats-row" id="statsRow" hidden>
+    <div class="stat-tile"><div class="label">收藏總數</div><div class="value" id="statTotal">0</div></div>
+    <div class="stat-tile"><div class="label">已分類</div><div class="value" id="statCategorized">0</div></div>
+    <div class="stat-tile"><div class="label">未分類</div><div class="value" id="statUncategorized">0</div></div>
+    <div class="stat-tile"><div class="label">分類數</div><div class="value" id="statCategories">0</div></div>
+  </div>
+
+  <section class="card" id="chartCard">
+    <h2>各分類收藏數量</h2>
+    <p class="hint">單一系列,以長度比較大小 (hover 檢視確切數字)。</p>
+    <svg id="barChart" role="img" aria-label="各分類收藏數量水平條形圖"></svg>
+    <div class="table-wrap">
+      <table id="chartTable" hidden>
+        <caption class="hint" style="text-align:left;padding:6px 0">表格視圖 (同圖表資料)</caption>
+        <thead><tr><th>分類</th><th class="num">數量</th></tr></thead>
+        <tbody id="chartTableBody"></tbody>
+      </table>
+    </div>
+    <div class="btn-row"><button class="subtle" id="btnToggleTable">顯示表格視圖</button></div>
+  </section>
+
+  <!-- ══════════════ 階段二:管理面板 ══════════════ -->
+  <section class="card" id="manageCard" hidden>
+    <div class="row-inline" style="justify-content:space-between; margin-bottom:12px;">
+      <div class="row-inline">
+        <input type="text" id="searchBox" placeholder="搜尋標題 / 作者 / 備註…" style="width: 280px;">
+        <div class="view-toggle">
+          <button id="viewGrid" aria-pressed="true">卡片</button>
+          <button id="viewTable" aria-pressed="false">清單</button>
+        </div>
+      </div>
+      <div class="row-inline">
+        <button id="btnAddCat">+ 新增分類</button>
+        <button class="primary" id="btnExport">匯出</button>
+        <button id="btnExportMd" class="subtle">匯出 Markdown</button>
+      </div>
+    </div>
+
+    <div class="cat-bar" id="catBar"></div>
+    <div id="grid"></div>
+    <table id="listTable" hidden>
+      <thead>
+        <tr><th>標題</th><th>作者</th><th>分類</th><th>備註</th><th>操作</th></tr>
+      </thead>
+      <tbody id="listBody"></tbody>
+    </table>
+    <div id="empty">目前篩選條件下沒有任何筆記</div>
+
+    <details class="raw" style="margin-top:16px">
+      <summary>批次分類 (依關鍵字自動規則)</summary>
+      <p class="hint">每行一條規則,格式:<code>分類名 = 關鍵字1,關鍵字2</code>。套用後符合標題/作者/備註的未分類筆記會被歸入該分類。</p>
+      <textarea id="ruleBox" style="min-height:110px" placeholder="美食 = 食譜,餐廳,小吃,烘焙
+穿搭 = 穿搭,ootd,搭配
+旅遊 = 旅遊,景點,行程,住宿"></textarea>
+      <div class="btn-row"><button id="btnApplyRules">套用規則</button></div>
+    </details>
+  </section>
+
+  <!-- ══════════════ 階段三:匯出 ══════════════ -->
+  <section class="card" id="exportCard" hidden>
+    <h2>匯出與備份</h2>
+    <p class="hint">JSON 適合再次匯入或分析;Markdown 適合貼進筆記軟體 (Obsidian / Notion)。</p>
+    <div class="btn-row">
+      <button class="primary" id="btnExport2">匯出 JSON</button>
+      <button id="btnExportMd2">匯出 Markdown</button>
+      <button id="btnCopyJson" class="subtle">複製 JSON 到剪貼簿</button>
+    </div>
+  </section>
+
+</div>
+
+<div id="toast" role="status"></div>
+
+<script>
+/* ============================================================
+   資料模型
+   ------------------------------------------------------------
+   統一內部格式 (normalize 後):
+   {
+     id:        string,   // note_id (唯一鍵,重複匯入自動去重)
+     title:     string,
+     url:       string,   // https://www.xiaohongshu.com/explore/{id}
+     cover:     string,   // 封面圖 URL (可能為空)
+     author:    string,
+     likedAt:   string,   // 收藏時間 (ISO,可能為空)
+     liked:     number,   // 點讚數 (可能 0)
+     noteType:  string,   // "normal" | "video"
+     category:  string,   // "" = 未分類
+     note:      string,   // 使用者備註
+   }
+   localStorage:
+     xhs_items      -> Item[]
+     xhs_categories -> string[]  (順序即顯示順序)
+   預設分類:美食、旅遊、穿搭、知識、未分類(保留字,不可刪)
+============================================================ */
+
+const LS_ITEMS = 'xhs_items';
+const LS_CATS  = 'xhs_categories';
+const CAT_ALL = '__ALL__';
+const CAT_NONE = '未分類';
+const DEFAULT_CATS = ['美食', '旅遊', '穿搭', '知識'];
+
+/* ---------- localStorage 存取 ---------- */
+function loadItems() {
+  try { return JSON.parse(localStorage.getItem(LS_ITEMS) || '[]'); }
+  catch { return []; }
+}
+function saveItems(items) { localStorage.setItem(LS_ITEMS, JSON.stringify(items)); }
+function loadCats() {
+  try {
+    const c = JSON.parse(localStorage.getItem(LS_CATS) || 'null');
+    return Array.isArray(c) && c.length ? c : [...DEFAULT_CATS];
+  } catch { return [...DEFAULT_CATS]; }
+}
+function saveCats(cats) { localStorage.setItem(LS_CATS, JSON.stringify(cats)); }
+
+let items = loadItems();
+let cats = loadCats();
+let activeCat = CAT_ALL;
+let viewMode = 'grid';
+let currentFilterText = '';
+
+/* ---------- 小工具 ---------- */
+const $ = (id) => document.getElementById(id);
+function toast(msg, ms = 2200) {
+  const t = $('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  clearTimeout(toast._tm);
+  toast._tm = setTimeout(() => t.classList.remove('show'), ms);
+}
+function fmtNum(n) {
+  if (n >= 10000) return (n / 10000).toFixed(1).replace(/\.0$/, '') + 'w';
+  return String(n);
+}
+function noteUrl(id, u) {
+  if (u && /^https?:/.test(u)) return u;
+  return 'https://www.xiaohongshu.com/explore/' + id;
+}
+
+/* ============================================================
+   階段一:解析各種貼入格式
+   支援:
+     1. 本工具匯出格式 {items:[...]}
+     2. 官方 API 回應 {data:{notes:[...]}} (收藏列表)
+     3. 官方 API 回應 {data:{note_list:[...]}} (收藏夾列表)
+     4. 油猴腳本匯出 {source:"xhs-tampermonkey", items:[...]}
+     5. 直接貼 notes 陣列 [ {...}, ... ]
+     6. cURL 指令字串 (抽取其中的 JSON 片段,盡力而為)
+============================================================ */
+function extractCurlJson(text) {
+  // 從 "copy as cURL" 中搶救 JSON:找最外層的 { 或 [
+  const s = text.indexOf("{"), a = text.indexOf("[");
+  let start = -1;
+  if (s === -1) start = a; else if (a === -1) start = s; else start = Math.min(s, a);
+  if (start === -1) return null;
+  // 從最後一個 } 或 ] 往回配對
+  const e = text.lastIndexOf("}"), b = text.lastIndexOf("]");
+  let end = Math.max(e, b);
+  if (end <= start) return null;
+  return text.slice(start, end + 1);
+}
+
+function tryParse(text) {
+  text = text.trim();
+  // 移除可能的 "data: " SSE 前綴或 JS 變數賦值
+  if (!text) return null;
+  let obj = null;
+  try { obj = JSON.parse(text); } catch {
+    const rescued = extractCurlJson(text);
+    if (rescued) { try { obj = JSON.parse(rescued); } catch { obj = null; } }
+  }
+  return obj;
+}
+
+/* 把「任何一種」來源的物件轉成內部格式;回傳 {list, source} */
+function normalize(obj) {
+  const out = [];
+  let source = 'unknown';
+
+  // 1) 本工具 / 油猴匯出
+  if (Array.isArray(obj?.items)) {
+    source = 'exported';
+    for (const it of obj.items) {
+      if (!it) continue;
+      const id = it.id || it.note_id || it.noteId || '';
+      if (!id) continue;
+      out.push(mkItem(id, it.title || it.display_title || '(無標題)', it.url || '',
+        it.cover || it.coverUrl || '', it.author || it.user || '', it.likedAt || it.time || '',
+        Number(it.liked) || 0, it.noteType || it.type || '', it.category || '', it.note || ''));
+    }
+    return { list: out, source };
+  }
+
+  // 2) 官方收藏 API: {data:{notes:[...]}}
+  const notes = obj?.data?.notes;
+  if (Array.isArray(notes)) {
+    source = 'api-notes';
+    for (const n of notes) {
+      const id = n.note_id || n.noteId || n.id || '';
+      if (!id) continue;
+      out.push(mkItem(
+        id,
+        n.display_title || n.title || '(無標題)',
+        n.note_url || n.url || '',
+        n.cover?.url || n.cover?.url_default || n.cover?.url_pre || n.cover || '',
+        n.user?.nickname || n.user?.nick_name || n.author || '',
+        n.collect_time ? new Date(Number(n.collect_time)).toISOString() : (n.time || ''),
+        Number(n.liked_count ?? n.interact_info?.liked_count) || 0,
+        n.type || '',
+        '', ''
+      ));
+    }
+    return { list: out, source };
+  }
+
+  // 3) 官方收藏夾 API: {data:{note_list:[...]}}
+  const nl = obj?.data?.note_list;
+  if (Array.isArray(nl)) {
+    source = 'api-fav-folder';
+    for (const n of nl) {
+      const id = n.note_id || n.id || '';
+      if (!id) continue;
+      out.push(mkItem(
+        id,
+        n.display_title || n.title || '(無標題)',
+        n.note_url || '',
+        n.cover?.url || n.cover?.url_default || n.cover || '',
+        n.user?.nickname || '',
+        n.timestamp ? new Date(Number(n.timestamp) * 1000).toISOString() : '',
+        Number(n.liked_count) || 0,
+        n.type || '', '', ''
+      ));
+    }
+    return { list: out, source };
+  }
+
+  // 4) 裸陣列
+  if (Array.isArray(obj)) {
+    source = 'array';
+    for (const n of obj) {
+      const id = n?.note_id || n?.id || n?.noteId || '';
+      if (!id) continue;
+      out.push(mkItem(
+        id,
+        n.display_title || n.title || '(無標題)',
+        n.note_url || n.url || '',
+        n.cover?.url || n.cover || (typeof n.cover === 'string' ? n.cover : ''),
+        n.user?.nickname || n.user?.nick_name || n.author || '',
+        n.time || '', Number(n.liked_count) || 0, n.type || '', '', ''
+      ));
+    }
+    return { list: out, source };
+  }
+
+  return { list: [], source: 'unrecognized' };
+}
+
+function mkItem(id, title, url, cover, author, likedAt, liked, noteType, category, note) {
+  return {
+    id: String(id), title: String(title || '(無標題)'), url: noteUrl(id, url),
+    cover: String(cover || ''), author: String(author || ''),
+    likedAt: likedAt ? String(likedAt) : '', liked: liked || 0,
+    noteType: noteType || '', category: category || '', note: note || '',
+  };
+}
+
+/* ---------- 匯入主流程 ---------- */
+function doImport() {
+  const text = $('importBox').value;
+  const log = $('importLog');
+  if (!text.trim()) { log.innerHTML = ''; logAppend('沒有輸入內容', true); return; }
+
+  const obj = tryParse(text);
+  if (!obj) {
+    logAppend('無法解析為 JSON。確認貼上的是完整 JSON(或含 JSON 的 cURL 指令)。', true);
+    return;
+  }
+
+  const { list, source } = normalize(obj);
+
+  // 顯示原始解析結果,方便除錯
+  $('rawDetails').hidden = false;
+  $('rawPreview').textContent = JSON.stringify(obj, null, 2).slice(0, 5000);
+
+  if (!list.length) {
+    logAppend(`解析成功但沒有辨識出筆記 (來源標記: ${source})。請展開「檢視原始解析結果」確認欄位結構。`, true);
+    return;
+  }
+
+  // 去重合併:既有備註/分類保留
+  const map = new Map(items.map(it => [it.id, it]));
+  let added = 0, updated = 0;
+  for (const it of list) {
+    const old = map.get(it.id);
+    if (old) {
+      map.set(it.id, { ...it, category: old.category, note: old.note }); // 保留使用者資料
+      updated++;
+    } else { map.set(it.id, it); added++; }
+  }
+  items = [...map.values()];
+  saveItems(items);
+  logAppend(`來源 ${source}:新增 ${added} 筆,更新 ${updated} 筆,總計 ${items.length} 筆。`, false);
+  renderAll();
+  toast(`已匯入 ${added} 筆`);
+}
+function logAppend(msg, isErr) {
+  const log = $('importLog');
+  const span = document.createElement('span');
+  span.className = isErr ? 'err' : 'ok';
+  span.textContent = msg;   // textContent — 貼入內容不可進 innerHTML
+  log.replaceChildren(span);
+}
+
+/* ============================================================
+   階段二:渲染
+============================================================ */
+function renderAll() {
+  const has = items.length > 0;
+  $('statsRow').hidden = !has;
+  $('chartCard').style.display = has ? '' : 'none';
+  $('manageCard').hidden = !has;
+  $('exportCard').hidden = !has;
+  if (!has) return;
+  renderStats();
+  renderChart();
+  renderCatBar();
+  renderList();
+}
+
+/* ---------- 統計 ---------- */
+function renderStats() {
+  const cat = items.filter(i => i.category).length;
+  $('statTotal').textContent = items.length;
+  $('statCategorized').textContent = cat;
+  $('statUncategorized').textContent = items.length - cat;
+  $('statCategories').textContent = cats.length;
+}
+
+/* ---------- 分類條形圖 (SVG,單一藍色) ---------- */
+function renderChart() {
+  const counts = countByCat();           // [{name, n}] 已排序
+  const svg = $('barChart');
+  const W = svg.clientWidth || 900;
+  const rowH = 28, barH = 16, padL = 96, padR = 56, padT = 6, padB = 24;
+  const H = padT + counts.length * rowH + padB;
+  const max = Math.max(...counts.map(c => c.n), 1);
+  const plotW = W - padL - padR;
+
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  svg.setAttribute('height', H);
+  svg.replaceChildren();
+
+  const NS = 'http://www.w3.org/2000/svg';
+  const mk = (tag, attrs) => {
+    const el = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+    return el;
+  };
+
+  // 基線 (x 軸)
+  svg.appendChild(mk('line', { x1: padL, y1: padT, x2: padL, y2: H - padB, class: 'axis-line' }));
+
+  counts.forEach((c, i) => {
+    const y = padT + i * rowH;
+    const w = Math.max((c.n / max) * plotW, 2);
+
+    // 數值直接標在條尾 (單一系列,selective labeling:全標但屬同一系列值)
+    const lbl = mk('text', {
+      x: padL + w + 8, y: y + barH / 2 + 4, class: 'bar-value',
+      'text-anchor': 'start',
+    });
+    lbl.textContent = c.n;
+    svg.appendChild(lbl);
+
+    const bar = mk('rect', {
+      x: padL, y: y + (rowH - barH) / 2, width: w, height: barH,
+      rx: 4, ry: 4, class: 'bar',
+      tabindex: 0,
+    });
+    bar.setAttribute('aria-label', `${c.name}: ${c.n} 筆`);
+    svg.appendChild(bar);
+
+    const catLbl = mk('text', { x: padL - 10, y: y + rowH / 2 + 4, class: 'bar-row-label', 'text-anchor': 'end' });
+    catLbl.textContent = c.name;
+    svg.appendChild(catLbl);
+  });
+
+  // 表格視圖 (同資料)
+  const tb = $('chartTableBody');
+  tb.replaceChildren();
+  for (const c of counts) {
+    const tr = document.createElement('tr');
+    const td1 = document.createElement('td'); td1.textContent = c.name;
+    const td2 = document.createElement('td'); td2.className = 'num'; td2.textContent = c.n;
+    tr.append(td1, td2); tb.appendChild(tr);
+  }
+}
+
+function countByCat() {
+  const m = new Map();
+  for (const c of cats) m.set(c, 0);
+  m.set(CAT_NONE, 0);
+  for (const it of items) {
+    const k = it.category && m.has(it.category) ? it.category : CAT_NONE;
+    m.set(k, m.get(k) + 1);
+  }
+  // 排序:依數量降序;未分類固定放最後
+  const arr = [...m.entries()].map(([name, n]) => ({ name, n }));
+  const none = arr.filter(x => x.name === CAT_NONE);
+  const rest = arr.filter(x => x.name !== CAT_NONE && x.n >= 0).sort((a, b) => b.n - a.n);
+  // 過濾掉數量 0 的自訂分類,避免圖表過長
+  const restVisible = rest.filter(x => x.n > 0);
+  return [...restVisible, ...none];
+}
+
+/* ---------- 分類列 ---------- */
+function renderCatBar() {
+  const bar = $('catBar');
+  bar.replaceChildren();
+
+  const mkChip = (key, label, n) => {
+    const chip = document.createElement('button');
+    chip.className = 'cat-chip' + (activeCat === key ? ' active' : '');
+    const t = document.createElement('span'); t.textContent = label;
+    const num = document.createElement('span'); num.className = 'n'; num.textContent = n;
+    chip.append(t, num);
+    chip.onclick = () => { activeCat = key; renderCatBar(); renderList(); };
+    return chip;
+  };
+
+  bar.appendChild(mkChip(CAT_ALL, '全部', items.length));
+  for (const c of cats) {
+    const n = items.filter(i => i.category === c).length;
+    const wrap = document.createElement('span');
+    wrap.style.position = 'relative';
+    wrap.appendChild(mkChip(c, c, n));
+    // 刪除分類 (長按右鍵:改用 ✕ 小按鈕)
+    if (c !== CAT_NONE) {
+      const del = document.createElement('button');
+      del.className = 'mini-btn del-btn';
+      del.textContent = '✕';
+      del.title = '刪除分類「' + c + '」(筆記會變成未分類)';
+      del.onclick = (e) => { e.stopPropagation(); removeCategory(c); };
+      del.style.padding = '4px 8px';
+      wrap.appendChild(del);
+      wrap.style.display = 'inline-flex'; wrap.style.gap = '4px'; wrap.style.alignItems = 'center';
+    }
+    bar.appendChild(wrap);
+  }
+  const nNone = items.filter(i => !i.category || !cats.includes(i.category)).length;
+  bar.appendChild(mkChip(CAT_NONE, CAT_NONE, nNone));
+}
+
+function removeCategory(name) {
+  if (!confirm(`刪除分類「${name}」?該分類下的筆記會變成未分類。`)) return;
+  cats = cats.filter(c => c !== name);
+  for (const it of items) if (it.category === name) it.category = '';
+  saveCats(cats); saveItems(items);
+  if (activeCat === name) activeCat = CAT_ALL;
+  renderAll();
+  toast(`已刪除分類「${name}」`);
+}
+
+/* ---------- 篩選 + 卡片網格 ---------- */
+function filtered() {
+  const q = currentFilterText.trim().toLowerCase();
+  return items.filter(it => {
+    if (activeCat === CAT_NONE) {
+      if (it.category && cats.includes(it.category)) return false;
+    } else if (activeCat !== CAT_ALL && it.category !== activeCat) {
+      return false;
+    }
+    if (!q) return true;
+    return (it.title + ' ' + it.author + ' ' + it.note).toLowerCase().includes(q);
+  });
+}
+
+function renderList() {
+  const list = filtered();
+  const grid = $('grid');
+  const table = $('listTable');
+  grid.replaceChildren();
+  $('listBody').replaceChildren();
+
+  $('empty').style.display = list.length ? 'none' : '';
+
+  if (viewMode === 'grid') {
+    table.hidden = true; grid.style.display = 'grid';
+    for (const it of list) grid.appendChild(renderCard(it));
+  } else {
+    grid.style.display = 'none'; table.hidden = false;
+    for (const it of list) $('listBody').appendChild(renderRow(it));
+  }
+}
+
+/* 單張筆記卡片 — 全部用 DOM API + textContent,封面 URL 只放 img.src */
+function renderCard(it) {
+  const card = document.createElement('article');
+  card.className = 'note-card';
+
+  const cover = document.createElement('a');
+  cover.className = 'note-cover';
+  cover.href = it.url; cover.target = '_blank'; cover.rel = 'noopener noreferrer';
+  if (it.cover) {
+    const img = document.createElement('img');
+    img.src = it.cover;
+    img.alt = it.title;
+    img.loading = 'lazy';
+    img.referrerPolicy = 'no-referrer';
+    img.onerror = () => { img.remove(); showFallback(cover, it); };
+    cover.appendChild(img);
+  } else {
+    showFallback(cover, it);
+  }
+  card.appendChild(cover);
+
+  const body = document.createElement('div');
+  body.className = 'note-body';
+
+  const title = document.createElement('a');
+  title.className = 'note-title';
+  title.href = it.url; title.target = '_blank'; title.rel = 'noopener noreferrer';
+  title.title = it.title;
+  title.textContent = it.title;
+  body.appendChild(title);
+
+  const meta = document.createElement('div');
+  meta.className = 'note-meta';
+  const author = document.createElement('span'); author.textContent = it.author || '—';
+  meta.appendChild(author);
+  if (it.liked) { const lk = document.createElement('span'); lk.textContent = '♥ ' + fmtNum(it.liked); meta.appendChild(lk); }
+  if (it.noteType === 'video') { const vt = document.createElement('span'); vt.textContent = '影片'; meta.appendChild(vt); }
+  body.appendChild(meta);
+
+  if (it.note) {
+    const nt = document.createElement('div');
+    nt.className = 'note-meta'; nt.style.color = 'var(--text-secondary)';
+    nt.textContent = '📝 ' + it.note;
+    body.appendChild(nt);
+  }
+
+  const actions = document.createElement('div');
+  actions.className = 'note-actions';
+
+  const sel = document.createElement('select');
+  sel.className = 'tag-select';
+  const optNone = document.createElement('option');
+  optNone.value = ''; optNone.textContent = CAT_NONE;
+  sel.appendChild(optNone);
+  for (const c of cats) {
+    const o = document.createElement('option');
+    o.value = c; o.textContent = c;
+    if (it.category === c) o.selected = true;
+    sel.appendChild(o);
+  }
+  sel.onchange = () => {
+    it.category = sel.value;
+    saveItems(items);
+    renderStats(); renderChart(); renderCatBar();
+  };
+  actions.appendChild(sel);
+
+  const open = document.createElement('a');
+  open.className = 'mini-btn'; open.textContent = '開啟';
+  open.href = it.url; open.target = '_blank'; open.rel = 'noopener noreferrer';
+  actions.appendChild(open);
+
+  const memo = document.createElement('button');
+  memo.className = 'mini-btn'; memo.textContent = '備註';
+  memo.onclick = () => {
+    const v = prompt('備註 (一行):', it.note || '');
+    if (v !== null) { it.note = v.trim(); saveItems(items); renderList(); }
+  };
+  actions.appendChild(memo);
+
+  const del = document.createElement('button');
+  del.className = 'mini-btn del-btn'; del.textContent = '刪除';
+  del.onclick = () => {
+    items = items.filter(x => x.id !== it.id);
+    saveItems(items); renderAll();
+  };
+  actions.appendChild(del);
+
+  body.appendChild(actions);
+  card.appendChild(body);
+  return card;
+}
+
+function showFallback(cover, it) {
+  const fb = document.createElement('div');
+  fb.className = 'fallback';
+  fb.textContent = it.noteType === 'video' ? '🎬 影片' : '無封面';
+  cover.appendChild(fb);
+}
+
+/* 清單視圖一列 */
+function renderRow(it) {
+  const tr = document.createElement('tr');
+  const tdT = document.createElement('td');
+  const a = document.createElement('a');
+  a.href = it.url; a.target = '_blank'; a.rel = 'noopener noreferrer';
+  a.textContent = it.title;
+  tdT.appendChild(a);
+  const tdA = document.createElement('td'); tdA.textContent = it.author || '—';
+  const tdC = document.createElement('td'); tdC.textContent = it.category || CAT_NONE;
+  const tdN = document.createElement('td'); tdN.textContent = it.note || '';
+  const tdO = document.createElement('td');
+  const del = document.createElement('button');
+  del.className = 'mini-btn del-btn'; del.textContent = '刪除';
+  del.onclick = () => { items = items.filter(x => x.id !== it.id); saveItems(items); renderAll(); };
+  tdO.appendChild(del);
+  tr.append(tdT, tdA, tdC, tdN, tdO);
+  return tr;
+}
+
+/* ============================================================
+   階段三:匯出
+============================================================ */
+function exportFile(content, filename, mime) {
+  const blob = new Blob([content], { type: mime + ';charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 3000);
+  toast('已下載 ' + filename);
+}
+
+function buildExportJson() {
+  return JSON.stringify({
+    exportedAt: new Date().toISOString(),
+    count: items.length,
+    categories: cats,
+    items: items.map(({ id, title, url, cover, author, likedAt, liked, noteType, category, note }) =>
+      ({ id, title, url, cover, author, likedAt, liked, noteType, category, note })),
+  }, null, 2);
+}
+
+function buildExportMarkdown() {
+  const groups = new Map();
+  for (const it of items) {
+    const k = it.category || CAT_NONE;
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(it);
+  }
+  const stamp = new Date().toISOString().slice(0, 10);
+  const lines = [`# 小紅書收藏備份 (${stamp})`, '', `共 ${items.length} 筆。`, ''];
+  for (const [cat, list] of groups) {
+    lines.push(`## ${cat} (${list.length})`, '');
+    for (const it of list) {
+      let row = `- [${it.title}](${it.url})`;
+      if (it.author) row += ` — ${it.author}`;
+      if (it.liked) row += ` (♥${fmtNum(it.liked)})`;
+      if (it.note) row += ` 📝 ${it.note}`;
+      lines.push(row);
+    }
+    lines.push('');
+  }
+  return lines.join('\n');
+}
+
+/* ============================================================
+   示範資料 (介面測試用)
+============================================================ */
+const DEMO = {
+  items: [
+    { id: 'demo001', title: '10 分鐘搞定!懶人版蔥油拌麵', url: '', cover: '', author: '小廚娘阿寶', liked: 12400, noteType: 'normal', category: '' },
+    { id: 'demo002', title: '東京五天四夜自由行攻略|景點+交通全解析', url: '', cover: '', author: '旅行筆記', liked: 8900, noteType: 'normal', category: '' },
+    { id: 'demo003', title: '秋冬穿搭|小個子顯高顯瘦公式', url: '', cover: '', author: '穿搭研究所', liked: 23100, noteType: 'video', category: '' },
+    { id: 'demo004', title: '用費曼學習法兩週讀完一本書(附模板)', url: '', cover: '', author: '知識卡片', liked: 5600, noteType: 'normal', category: '' },
+    { id: 'demo005', title: '超簡單!電鍋就能做的起司蛋糕', url: '', cover: '', author: '烘焙日常', liked: 15800, noteType: 'normal', category: '' },
+    { id: 'demo006', title: '京都賞楓私房景點TOP5', url: '', cover: '', author: '旅行筆記', liked: 6700, noteType: 'normal', category: '' },
+    { id: 'demo007', title: '膠囊衣櫥|30 件單品穿出 90 天不重複', url: '', cover: '', author: '極簡衣櫥', liked: 30200, noteType: 'video', category: '' },
+    { id: 'demo008', title: '睡前 10 分鐘拉伸,改善圓肩駝背', url: '', cover: '', author: '健康筆記', liked: 4400, noteType: 'normal', category: '' },
+    { id: 'demo009', title: '夜市必吃清單!在地人推薦的 8 攤', url: '', cover: '', author: '吃貨地圖', liked: 9200, noteType: 'normal', category: '' },
+    { id: 'demo010', title: '新手理財|記帳三個月後我學到的 5 件事', url: '', cover: '', author: '知識卡片', liked: 7300, noteType: 'normal', category: '' },
+  ],
+};
+
+/* ============================================================
+   事件綁定
+============================================================ */
+$('btnImport').onclick = doImport;
+$('importBox').addEventListener('paste', () => setTimeout(doImport, 60)); // 貼上即解析
+
+$('btnImportFile').onclick = () => $('fileInput').click();
+$('fileInput').onchange = async (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  try {
+    $('importBox').value = await f.text();
+    doImport();
+  } catch (err) {
+    logAppend('讀檔失敗:' + err.message, true);
+  }
+};
+
+$('btnDemo').onclick = () => {
+  $('importBox').value = JSON.stringify(DEMO);
+  doImport();
+};
+
+$('btnClear').onclick = () => {
+  if (!items.length && !confirm('目前沒有資料,仍要重設分類嗎?')) return;
+  if (items.length && !confirm(`確定清空全部 ${items.length} 筆資料與自訂分類?此動作無法復原。`)) return;
+  items = []; cats = [...DEFAULT_CATS]; activeCat = CAT_ALL;
+  localStorage.removeItem(LS_ITEMS); localStorage.removeItem(LS_CATS);
+  $('importBox').value = '';
+  renderAll();
+  toast('已清空');
+};
+
+$('searchBox').oninput = (e) => { currentFilterText = e.target.value; renderList(); };
+
+$('viewGrid').onclick = () => setView('grid');
+$('viewTable').onclick = () => setView('table');
+function setView(v) {
+  viewMode = v;
+  $('viewGrid').setAttribute('aria-pressed', v === 'grid');
+  $('viewTable').setAttribute('aria-pressed', v === 'table');
+  renderList();
+}
+
+$('btnAddCat').onclick = () => {
+  const name = prompt('新分類名稱:');
+  if (!name) return;
+  const n = name.trim();
+  if (!n) return;
+  if (n === CAT_NONE) { toast('「' + CAT_NONE + '」為保留字'); return; }
+  if (cats.includes(n)) { toast('分類已存在'); return; }
+  cats.push(n); saveCats(cats);
+  renderAll();
+  toast('已新增分類「' + n + '」');
+};
+
+$('btnToggleTable').onclick = () => {
+  const t = $('chartTable');
+  t.hidden = !t.hidden;
+  $('btnToggleTable').textContent = t.hidden ? '顯示表格視圖' : '隱藏表格視圖';
+};
+
+/* 匯出 (兩處按鈕同功能) */
+const doExportJson = () => exportFile(buildExportJson(), `xhs-favorites-${Date.now()}.json`, 'application/json');
+const doExportMd  = () => exportFile(buildExportMarkdown(), `xhs-favorites-${Date.now()}.md`, 'text/markdown');
+$('btnExport').onclick = doExportJson;
+$('btnExport2').onclick = doExportJson;
+$('btnExportMd').onclick = doExportMd;
+$('btnExportMd2').onclick = doExportMd;
+$('btnCopyJson').onclick = async () => {
+  try {
+    await navigator.clipboard.writeText(buildExportJson());
+    toast('JSON 已複製到剪貼簿');
+  } catch {
+    toast('複製失敗,請改用匯出 JSON', 3000);
+  }
+};
+
+/* 批次規則 */
+$('btnApplyRules').onclick = () => {
+  const lines = $('ruleBox').value.split('\n').map(s => s.trim()).filter(Boolean);
+  if (!lines.length) { toast('沒有規則可套用'); return; }
+  const rules = [];
+  for (const ln of lines) {
+    const m = ln.split('=');
+    if (m.length !== 2) continue;
+    const cat = m[0].trim();
+    const kws = m[1].split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+    if (cat && kws.length) rules.push({ cat, kws });
+  }
+  if (!rules.length) { toast('規則格式不正確,每行需為「分類 = 關鍵字1,關鍵字2」'); return; }
+
+  // 確保規則用到的分類存在
+  for (const r of rules) if (!cats.includes(r.cat)) cats.push(r.cat);
+  saveCats(cats);
+
+  let n = 0;
+  for (const it of items) {
+    if (it.category) continue; // 只處理未分類
+    const hay = (it.title + ' ' + it.author + ' ' + it.note).toLowerCase();
+    for (const r of rules) {
+      if (r.kws.some(k => hay.includes(k))) { it.category = r.cat; n++; break; }
+    }
+  }
+  saveItems(items);
+  renderAll();
+  toast(`已自動分類 ${n} 筆`);
+};
+
+/* 視窗縮放重畫圖表 */
+window.addEventListener('resize', () => { if (items.length) renderChart(); });
+
+/* 初始渲染 */
+renderAll();
+</script>
+</body>
+</html>
