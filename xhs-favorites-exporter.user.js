@@ -1,11 +1,11 @@
 // ==UserScript==
 // @name         小紅書收藏匯出器 (XHS Favorites Exporter)
 // @namespace    xhs-local-tools
-// @version      0.2.0
+// @version      0.2.1
 // @description  在小紅書收藏頁讀取已載入的收藏卡片,存入 LocalStorage,並可一鍵複製 JSON 貼到「收藏管理台」。
 // @author       you
-// @match        https://www.xiaohongshu.com/user/profile/*
-// @match        https://www.xiaohongshu.com/*
+// @match        *://*.xiaohongshu.com/*
+// @noframes
 // @run-at       document-idle
 // @grant        GM_setClipboard
 // @grant        GM_registerMenuCommand
@@ -35,6 +35,9 @@
 
 (function () {
   'use strict';
+
+  // 診斷訊息:開 F12 Console 看到這行 = 腳本有被注入;沒看到 = 腳本根本沒執行
+  console.log('[XHS匯出器] v0.2.1 已載入 →', location.href);
 
   var LS_KEY = 'xhs_tm_favorites';
   var MAX_STORE = 5000; // LocalStorage 上限保護
@@ -239,6 +242,7 @@
 
     document.body.appendChild(panel);
     updateBadge();
+    console.log('[XHS匯出器] 浮動面板已建立在頁面右下角');
   }
 
   function updateBadge() {
@@ -257,14 +261,19 @@
     }
   }, 1500);
 
+  /* ---------- 啟動:body 可能晚於 document-idle 才有,用雙保險 ---------- */
+  function boot() {
+    try { buildPanel(); }
+    catch (e) { console.warn('[XHS匯出器] 建面板失敗:', e); }
+  }
+  if (document.body) boot();
+  else document.addEventListener('DOMContentLoaded', boot);
+  // 極端情況:body 被 SPA 重建,定時器會再救一次(見上方 setInterval)
+
   /* ---------- 選單指令 (Tampermonkey 圖示選單) ---------- */
   if (typeof GM_registerMenuCommand === 'function') {
     GM_registerMenuCommand('① 掃描本頁收藏', scan);
     GM_registerMenuCommand('② 複製累積 JSON', copyJson);
     GM_registerMenuCommand('清除本機累積資料', clearData);
   }
-
-  /* ---------- 啟動 ---------- */
-  if (document.body) buildPanel();
-  else window.addEventListener('DOMContentLoaded', buildPanel);
 })();
